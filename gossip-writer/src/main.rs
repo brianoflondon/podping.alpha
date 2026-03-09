@@ -27,7 +27,10 @@ use crate::plexo_message_capnp::plexo_message;
 
 // Podping schema types for deserialization
 use podping_schemas::org::podcastindex::podping::podping_write_capnp::podping_write;
+use podping_schemas::org::podcastindex::podping::podping_medium_capnp::PodpingMedium;
+use podping_schemas::org::podcastindex::podping::podping_reason_capnp::PodpingReason;
 use podping_schemas::org::podcastindex::podping::hivewriter::podping_hive_transaction_capnp::podping_hive_transaction;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // PeerAnnounce: periodic node ID announcement over gossip.
@@ -155,6 +158,16 @@ const TOPIC_STRING: &str = "gossipping/v1/all";
 const DEFAULT_DHT_SECRET: &str = "podping_gossip_default_secret";
 const DEFAULT_PEER_ENDORSE_INTERVAL: u64 = 600;
 const REBOOTSTRAP_TIMEOUT: u64 = 180;
+const BATCH_INTERVAL_SECS: u64 = 3;
+
+// A pending IRI extracted from a ZMQ message, waiting to be batched
+struct PendingPing {
+    iri: String,
+    medium_str: &'static str,
+    reason_str: &'static str,
+    medium_raw: u16,
+    reason_raw: u16,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -531,8 +544,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pull_socket.bind(&zmq_bind_clone).unwrap();
         println!("  ZMQ PAIR socket bound on {}", zmq_bind_clone);
 
+        let mut pending: Vec<PendingPing> = Vec::new();
+        let mut last_flush = std::time::Instant::now();
+
         loop {
             if shutdown_zmq.load(Ordering::Relaxed) {
+                // Flush remaining before shutdown
+                if !pending.is_empty() {
+                    flush_batch(
+                        &mut pending,
+                        &signing_key_clone,
+                        &pubkey_hex_clone,
+                        db.as_ref(),
+                        &tx,
+                        &pull_socket,
+                    );
+                }
                 println!("  ZMQ thread: shutdown signal received.");
                 break;
             }
@@ -540,28 +567,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut msg = zmq::Message::new();
             match pull_socket.recv(&mut msg, 0) {
                 Ok(_) => {
-                    match process_message(
-                        &msg,
-                        &signing_key_clone,
-                        &pubkey_hex_clone,
-                        db.as_ref(),
-                        &tx,
-                        &pull_socket,
-                    ) {
-                        Ok(_) => {}
+                    match parse_zmq_message(&msg) {
+                        Ok(Some(ping)) => {
+                            println!(
+                                "\x1b[36m[ZMQ] Received: [{}] reason={} medium={}\x1b[0m",
+                                ping.iri, ping.reason_str, ping.medium_str
+                            );
+                            pending.push(ping);
+                        }
+                        Ok(None) => {} // not a PodpingWrite, ignored
                         Err(e) => {
-                            eprintln!("\x1b[35m[WARN] Error processing ZMQ message: {}\x1b[0m", e);
+                            eprintln!("\x1b[35m[WARN] Error parsing ZMQ message: {}\x1b[0m", e);
                         }
                     }
                 }
                 Err(zmq::Error::EAGAIN) => {
-                    // recv timeout - loop back and check shutdown flag
-                    continue;
+                    // recv timeout - fall through to flush check
                 }
                 Err(e) => {
                     eprintln!("\x1b[35m[WARN] ZMQ recv error: {}\x1b[0m", e);
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
+            }
+
+            // Flush batch every BATCH_INTERVAL_SECS
+            if last_flush.elapsed() >= std::time::Duration::from_secs(BATCH_INTERVAL_SECS)
+                && !pending.is_empty()
+            {
+                flush_batch(
+                    &mut pending,
+                    &signing_key_clone,
+                    &pubkey_hex_clone,
+                    db.as_ref(),
+                    &tx,
+                    &pull_socket,
+                );
+                last_flush = std::time::Instant::now();
             }
         }
     });
@@ -580,29 +621,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Process a single ZMQ message: deserialize Cap'n Proto, build notification,
-// sign, archive, and send to the broadcast channel.
-fn process_message(
+// Parse a ZMQ message and extract the IRI, medium, and reason.
+// Returns None for non-PodpingWrite messages.
+fn parse_zmq_message(
     msg: &zmq::Message,
-    signing_key: &ed25519_dalek::SigningKey,
-    pubkey_hex: &str,
-    db: Option<&archive::Archive>,
-    tx: &mpsc::Sender<Vec<u8>>,
-    socket: &zmq::Socket,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Read the PlexoMessage wrapper
+) -> Result<Option<PendingPing>, Box<dyn std::error::Error>> {
     let message_reader =
         capnp::serialize::read_message(msg.as_ref(), capnp::message::ReaderOptions::new())?;
     let plexo_msg = message_reader.get_root::<plexo_message::Reader>()?;
     let payload_type = plexo_msg.get_type_name()?.to_str()?;
 
-    // We only care about PodpingWrite messages
     if payload_type != "org.podcastindex.podping.hivewriter.PodpingWrite.capnp" {
         eprintln!("\x1b[35m[WARN] Ignoring non-PodpingWrite message: {}\x1b[0m", payload_type);
-        return Ok(());
+        return Ok(None);
     }
 
-    // Extract the PodpingWrite from the plexo payload
     let inner_reader = capnp::serialize::read_message(
         plexo_msg.get_payload()?,
         capnp::message::ReaderOptions::new(),
@@ -613,93 +646,142 @@ fn process_message(
     let reason_enum = podping.get_reason()?;
     let medium_enum = podping.get_medium()?;
 
-    // Map capnp enums to Gossipping string values
-    let reason_str = notification::reason_to_string(reason_enum as u16);
-    let medium_str = notification::medium_to_string(medium_enum as u16);
+    let medium_raw = medium_enum as u16;
+    let reason_raw = reason_enum as u16;
+    let medium_str = notification::medium_to_string(medium_raw);
+    let reason_str = notification::reason_to_string(reason_raw);
 
-    println!(
-        "\x1b[36m[ZMQ] Received: [{}] reason={} medium={}\x1b[0m",
-        iri, reason_str, medium_str
-    );
+    Ok(Some(PendingPing {
+        iri,
+        medium_str,
+        reason_str,
+        medium_raw,
+        reason_raw,
+    }))
+}
 
-    // Build and sign the Gossipping notification
-    let iri_clone = iri.clone();
-    let mut notif =
-        notification::GossipNotification::new(pubkey_hex, medium_str, reason_str, vec![iri]);
-    let signed_payload = notif.sign(signing_key);
+// Flush the pending batch: group by (medium, reason), build one GossipNotification
+// per group, broadcast, then send a ZMQ reply for each IRI.
+fn flush_batch(
+    pending: &mut Vec<PendingPing>,
+    signing_key: &ed25519_dalek::SigningKey,
+    pubkey_hex: &str,
+    db: Option<&archive::Archive>,
+    tx: &mpsc::Sender<Vec<u8>>,
+    socket: &zmq::Socket,
+) {
+    // Group IRIs by (medium_str, reason_str)
+    let mut groups: HashMap<(&'static str, &'static str), Vec<String>> = HashMap::new();
+    for ping in pending.iter() {
+        groups.entry((ping.medium_str, ping.reason_str))
+            .or_default()
+            .push(ping.iri.clone());
+    }
 
-    // Archive to SQLite (INSERT OR IGNORE by content hash)
-    if let Some(db) = db {
-        match db.store(
-            &signed_payload,
-            pubkey_hex,
-            medium_str,
-            reason_str,
-            notif.timestamp,
-            notif.iris.len(),
-        ) {
-            Ok(true) => println!("\x1b[36m[ZMQ]   Archived (new).\x1b[0m"),
-            Ok(false) => println!("\x1b[36m[ZMQ]   Archived (duplicate, skipped).\x1b[0m"),
-            Err(e) => eprintln!("\x1b[35m[WARN]  Archive error: {}\x1b[0m", e),
+    // Build, sign, archive, and broadcast one notification per group
+    let mut broadcast_ok = false;
+    for ((medium_str, reason_str), iris) in &groups {
+        let iri_count = iris.len();
+        let mut notif =
+            notification::GossipNotification::new(pubkey_hex, medium_str, reason_str, iris.clone());
+        let signed_payload = notif.sign(signing_key);
+
+        if let Some(db) = db {
+            match db.store(
+                &signed_payload,
+                pubkey_hex,
+                medium_str,
+                reason_str,
+                notif.timestamp,
+                iri_count,
+            ) {
+                Ok(true) => println!("\x1b[36m[BATCH] Archived (new).\x1b[0m"),
+                Ok(false) => println!("\x1b[36m[BATCH] Archived (duplicate, skipped).\x1b[0m"),
+                Err(e) => eprintln!("\x1b[35m[WARN]  Archive error: {}\x1b[0m", e),
+            }
+        }
+
+        match tx.blocking_send(signed_payload) {
+            Ok(_) => {
+                println!(
+                    "\x1b[32m[BATCH] Broadcast {} IRIs (medium={} reason={})\x1b[0m",
+                    iri_count, medium_str, reason_str
+                );
+                broadcast_ok = true;
+            }
+            Err(e) => {
+                eprintln!("\x1b[35m[WARN]  Failed to queue batch for broadcast: {}\x1b[0m", e);
+            }
         }
     }
 
-    // Send to the async broadcast task via mpsc channel
-    match tx.blocking_send(signed_payload) {
-        Ok(_) => {
-            println!("\x1b[32m[ZMQ]   Queued for gossip broadcast.\x1b[0m");
+    // Send a ZMQ reply for each IRI so the front-end can dequeue them
+    if broadcast_ok {
+        let timestamp_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let timestamp_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
 
-            // Build a PodpingHiveTransaction reply so podping can remove the IRI from the queue
-            let timestamp_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            let timestamp_ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
+        for ping in pending.iter() {
+            let medium_enum = PodpingMedium::try_from(ping.medium_raw).unwrap();
+            let reason_enum = PodpingReason::try_from(ping.reason_raw).unwrap();
 
-            // Build inner PodpingHiveTransaction
-            let mut tx_message = capnp::message::Builder::new_default();
-            {
-                let mut hive_tx = tx_message.init_root::<podping_hive_transaction::Builder>();
-                hive_tx.set_hive_tx_id("gossip");
-                hive_tx.set_hive_block_num(timestamp_secs);
-                let mut podpings = hive_tx.init_podpings(1);
-                {
-                    let mut pp = podpings.reborrow().get(0);
-                    pp.set_medium(medium_enum);
-                    pp.set_reason(reason_enum);
-                    pp.set_timestamp_ns(timestamp_ns);
-                    pp.set_session_id(0);
-                    let mut iris = pp.init_iris(1);
-                    iris.set(0, &iri_clone);
-                }
-            }
-
-            // Serialize the inner message
-            let mut tx_payload = Vec::new();
-            capnp::serialize::write_message(&mut tx_payload, &tx_message)?;
-
-            // Wrap in PlexoMessage
-            let mut plexo_builder = capnp::message::Builder::new_default();
-            {
-                let mut plexo = plexo_builder.init_root::<plexo_message::Builder>();
-                plexo.set_type_name("org.podcastindex.podping.hivewriter.PodpingHiveTransaction.capnp");
-                plexo.set_payload(capnp::data::Reader::from(tx_payload.as_slice()));
-            }
-
-            // Serialize and send the reply
-            let mut reply_buf = Vec::new();
-            capnp::serialize::write_message(&mut reply_buf, &plexo_builder)?;
-            match socket.send(&reply_buf, zmq::DONTWAIT) {
-                Ok(_) => println!("\x1b[36m[ZMQ]   Sent PodpingHiveTransaction reply (gossip).\x1b[0m"),
-                Err(e) => eprintln!("\x1b[35m[WARN]  Failed to send reply: {}\x1b[0m", e),
+            if let Err(e) = send_zmq_reply(socket, &ping.iri, medium_enum, reason_enum, timestamp_secs, timestamp_ns) {
+                eprintln!("\x1b[35m[WARN]  Failed to send reply for {}: {}\x1b[0m", ping.iri, e);
             }
         }
-        Err(e) => eprintln!("\x1b[35m[WARN]  Failed to queue for broadcast: {}\x1b[0m", e),
+        println!(
+            "\x1b[36m[BATCH] Sent {} ZMQ replies\x1b[0m",
+            pending.len()
+        );
     }
 
+    pending.clear();
+}
+
+// Build and send a PodpingHiveTransaction reply for a single IRI
+fn send_zmq_reply(
+    socket: &zmq::Socket,
+    iri: &str,
+    medium_enum: PodpingMedium,
+    reason_enum: PodpingReason,
+    timestamp_secs: u64,
+    timestamp_ns: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut tx_message = capnp::message::Builder::new_default();
+    {
+        let mut hive_tx = tx_message.init_root::<podping_hive_transaction::Builder>();
+        hive_tx.set_hive_tx_id("gossip");
+        hive_tx.set_hive_block_num(timestamp_secs);
+        let mut podpings = hive_tx.init_podpings(1);
+        {
+            let mut pp = podpings.reborrow().get(0);
+            pp.set_medium(medium_enum);
+            pp.set_reason(reason_enum);
+            pp.set_timestamp_ns(timestamp_ns);
+            pp.set_session_id(0);
+            let mut iris = pp.init_iris(1);
+            iris.set(0, iri);
+        }
+    }
+
+    let mut tx_payload = Vec::new();
+    capnp::serialize::write_message(&mut tx_payload, &tx_message)?;
+
+    let mut plexo_builder = capnp::message::Builder::new_default();
+    {
+        let mut plexo = plexo_builder.init_root::<plexo_message::Builder>();
+        plexo.set_type_name("org.podcastindex.podping.hivewriter.PodpingHiveTransaction.capnp");
+        plexo.set_payload(capnp::data::Reader::from(tx_payload.as_slice()));
+    }
+
+    let mut reply_buf = Vec::new();
+    capnp::serialize::write_message(&mut reply_buf, &plexo_builder)?;
+    socket.send(&reply_buf, zmq::DONTWAIT)?;
     Ok(())
 }
 
