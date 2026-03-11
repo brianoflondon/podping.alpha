@@ -15,14 +15,18 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Create GitHub Release (if missing)
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          if gh release view "$GITHUB_REF_NAME" -R "$GH_REPO" >/dev/null 2>&1; then
             echo "Release $GITHUB_REF_NAME already exists."
           else
-            gh release create "$GITHUB_REF_NAME" --generate-notes
+            gh release create "$GITHUB_REF_NAME" -R "$GH_REPO" --generate-notes
           fi
         env:
+          GH_REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-release:
@@ -88,8 +92,9 @@ jobs:
         shell: pwsh
 
       - name: Upload release asset
-        run: gh release upload "$GITHUB_REF_NAME" "dist/${{ matrix.artifact_name }}" --clobber
+        run: gh release upload "$GITHUB_REF_NAME" "dist/${{ matrix.artifact_name }}" --clobber -R "$GH_REPO"
         env:
+          GH_REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate checksums
@@ -107,6 +112,7 @@ jobs:
         shell: pwsh
 
       - name: Upload checksum asset
-        run: gh release upload "$GITHUB_REF_NAME" "dist/${{ matrix.artifact_name }}.sha256" --clobber
+        run: gh release upload "$GITHUB_REF_NAME" "dist/${{ matrix.artifact_name }}.sha256" --clobber -R "$GH_REPO"
         env:
+          GH_REPO: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
