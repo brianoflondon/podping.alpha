@@ -34,6 +34,33 @@ cargo build --release --manifest-path gossip-listener/Cargo.toml
 ./gossip-listener/target/release/gossip-listener
 ```
 
+### With prebuilt binaries (GitHub Releases)
+
+When you tag a release (e.g., `v1.2.3`), the GitHub Action publishes binaries
+for Linux, macOS, and Windows under the release assets.
+
+Download and verify:
+
+```sh
+VERSION="v1.2.3"
+OS=linux # linux | macos | windows
+ARCH=x86_64 # x86_64 | aarch64
+URL="https://github.com/<owner>/<repo>/releases/download/${VERSION}/gossip-listener-${VERSION}-${OS}-${ARCH}.tar.gz"
+curl -L "$URL" -o gossip-listener.tar.gz
+tar -xzf gossip-listener.tar.gz
+./gossip-listener
+```
+
+Windows (PowerShell):
+
+```powershell
+$Version = "v1.2.3"
+$Url = "https://github.com/<owner>/<repo>/releases/download/$Version/gossip-listener-$Version-windows-x86_64.zip"
+Invoke-WebRequest -Uri $Url -OutFile gossip-listener.zip
+Expand-Archive -Path gossip-listener.zip -DestinationPath .
+./gossip-listener.exe
+```
+
 ### With Docker
 
 Build locally from this repo:
