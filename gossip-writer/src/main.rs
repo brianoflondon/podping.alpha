@@ -198,7 +198,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown location".to_string());
         let is_iroh = location.contains("iroh-quinn") || payload.contains("drained connections");
-        let is_actor_shutdown = payload.contains("actor stopped");
+        let is_actor_shutdown = payload.contains("actor stopped")
+            || payload.contains("must not be polled after");
         if is_iroh {
             eprintln!("\x1b[1;31m[PANIC] Known iroh-quinn 0.16.1 bug at {}: {}\x1b[0m", location, payload);
             eprintln!("\x1b[1;31m[PANIC] This is an upstream bug, not a gossip-writer issue. Process will restart via Docker.\x1b[0m");
