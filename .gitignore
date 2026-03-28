@@ -35,3 +35,4 @@ gossip_listener_known_peers.txt
 *log*/
 
 gossip-writer/data/*
+result

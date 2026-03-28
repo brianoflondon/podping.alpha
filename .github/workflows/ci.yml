@@ -1,0 +1,182 @@
+name: CI/CD - gossip-listener
+
+on:
+  push:
+    branches: ["master", "develop"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["master", "develop"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/gossip-listener
+
+jobs:
+  # ==========================================
+  # PHASE 1: Build & Save Raw Binaries
+  # ==========================================
+  build-binaries:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_path: target/x86_64-unknown-linux-gnu/release/gossip-listener
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            bin_path: target/aarch64-unknown-linux-gnu/release/gossip-listener
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            bin_path: target/armv7-unknown-linux-gnueabihf/release/gossip-listener
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin_path: target/x86_64-apple-darwin/release/gossip-listener
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin_path: target/aarch64-apple-darwin/release/gossip-listener
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_path: target\x86_64-pc-windows-msvc\release\gossip-listener.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Cross (Linux Only)
+        if: contains(matrix.os, 'ubuntu')
+        run: cargo install cross --locked
+
+      - name: Build (Linux)
+        if: contains(matrix.os, 'ubuntu')
+        run: cross build --release --manifest-path gossip-listener/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Build (Windows/Mac)
+        if: contains(matrix.os, 'ubuntu') == false
+        run: cargo build --release --manifest-path gossip-listener/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}-binary
+          path: gossip-listener/${{ matrix.bin_path }}
+          retention-days: 1
+
+  # ==========================================
+  # PHASE 2: Package & Publish GitHub Release
+  # ==========================================
+  publish-release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package Binaries & Generate Checksums
+        run: |
+          mkdir -p dist
+          TAG_NAME="${{ github.ref_name }}"
+
+          package_tar() {
+            local target=$1
+            local os_arch=$2
+            local bin_path="artifacts/${target}-binary/gossip-listener"
+            local archive_name="gossip-listener-${TAG_NAME}-${os_arch}.tar.gz"
+            
+            chmod +x "$bin_path"
+            tar -czf "dist/${archive_name}" -C "artifacts/${target}-binary" gossip-listener
+            cd dist && shasum -a 256 "${archive_name}" > "${archive_name}.sha256" && cd ..
+          }
+
+          package_zip() {
+            local target=$1
+            local os_arch=$2
+            local bin_path="artifacts/${target}-binary/gossip-listener.exe"
+            local archive_name="gossip-listener-${TAG_NAME}-${os_arch}.zip"
+            
+            zip -j "dist/${archive_name}" "$bin_path"
+            cd dist && shasum -a 256 "${archive_name}" > "${archive_name}.sha256" && cd ..
+          }
+
+          package_tar "x86_64-unknown-linux-gnu" "linux-x86_64"
+          package_tar "aarch64-unknown-linux-gnu" "linux-aarch64"
+          package_tar "armv7-unknown-linux-gnueabihf" "linux-armv7"
+          package_tar "x86_64-apple-darwin" "macos-x86_64"
+          package_tar "aarch64-apple-darwin" "macos-aarch64"
+          package_zip "x86_64-pc-windows-msvc" "windows-x86_64"
+
+      - name: Create Release and Upload Assets
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* -R "${{ github.repository }}" --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================
+  # PHASE 3: Build & Push Docker Image
+  # ==========================================
+  build-and-push-image:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.gossip-listener
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

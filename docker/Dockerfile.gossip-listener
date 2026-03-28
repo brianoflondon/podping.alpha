@@ -1,35 +1,29 @@
-# syntax=docker/dockerfile:1.7
+# Switch to the standard Alpine base image
+FROM alpine:latest
 
-FROM rust:1.94-slim-trixie AS builder
+# Docker Buildx automatically populates these variables
+ARG TARGETARCH
+ARG TARGETVARIANT
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates pkg-config libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
-WORKDIR /src
+# Copy all the downloaded artifacts from the GitHub Actions runner
+COPY artifacts /tmp/artifacts
 
-COPY gossip-listener/Cargo.toml gossip-listener/Cargo.lock ./gossip-listener/
-RUN mkdir -p /src/gossip-listener/src
+# apk is Alpine's package manager (replacing apt-get)
+# We install ca-certificates for web requests, and gcompat to run the glibc binaries
+RUN apk update && \
+    apk add --no-cache ca-certificates gcompat && \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+      cp /tmp/artifacts/x86_64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+      cp /tmp/artifacts/aarch64-unknown-linux-gnu-binary/gossip-listener /app/gossip-listener; \
+    elif [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
+      cp /tmp/artifacts/armv7-unknown-linux-gnueabihf-binary/gossip-listener /app/gossip-listener; \
+    else \
+      echo "Unsupported architecture: $TARGETARCH$TARGETVARIANT" && exit 1; \
+    fi && \
+    chmod +x /app/gossip-listener && \
+    rm -rf /tmp/artifacts
 
-COPY gossip-listener/src ./gossip-listener/src
-
-WORKDIR /src/gossip-listener
-RUN cargo build --release
-RUN strip target/release/gossip-listener
-
-FROM debian:trixie-slim AS runtime
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN useradd -u 1000 -m app \
-    && mkdir -p /data \
-    && chown -R 1000:1000 /data
-
-COPY --from=builder /src/gossip-listener/target/release/gossip-listener /usr/local/bin/gossip-listener
-
-USER 1000
-WORKDIR /data
-
-ENTRYPOINT ["/usr/local/bin/gossip-listener"]
+ENTRYPOINT ["/app/gossip-listener"]
