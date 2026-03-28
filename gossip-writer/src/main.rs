@@ -10,6 +10,7 @@ use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::os::unix::io::FromRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -182,8 +183,18 @@ struct PendingPing {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Write tracing output to fd 3 if available, otherwise stderr
+    let trace_writer: Box<dyn std::io::Write + Send + Sync> = unsafe {
+        if libc::fcntl(3, libc::F_GETFD) != -1 {
+            Box::new(std::fs::File::from_raw_fd(3))
+        } else {
+            Box::new(std::io::stderr())
+        }
+    };
+    let trace_writer = std::sync::Mutex::new(trace_writer);
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(trace_writer)
         .init();
 
     // WORKAROUND: iroh-quinn 0.16.1 panic resilience

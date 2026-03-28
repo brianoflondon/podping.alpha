@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "gossip-writer"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "blake3",
  "bytes",
@@ -1305,6 +1305,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-gossip",
+ "libc",
  "podping-schemas",
  "rand",
  "rusqlite",
