@@ -234,14 +234,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fd3_ok = std::env::var("TRACE_FD3").as_deref() == Ok("1")
             && libc::fstat(3, &mut stat) == 0
             && {
-            let ft = stat.st_mode & libc::S_IFMT;
-            ft == libc::S_IFIFO || ft == libc::S_IFREG
-        };
+                let ft = stat.st_mode & libc::S_IFMT;
+                ft == libc::S_IFIFO || ft == libc::S_IFREG
+            };
         if fd3_ok {
             Box::new(std::fs::File::from_raw_fd(3))
         } else {
             Box::new(std::io::stderr())
-        };
+        }
+    };
     let trace_writer = std::sync::Mutex::new(trace_writer);
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
