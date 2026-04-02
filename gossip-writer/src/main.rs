@@ -1457,6 +1457,9 @@ fn spawn_receive_task(
             }
             match event {
                 Ok(Event::Received(msg)) => {
+                    // Any received message means gossip is alive — update watchdog timer
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    last_notification_time.store(now, Ordering::Relaxed);
                     // Try PeerAnnounce first
                     if let Ok(announce) = serde_json::from_slice::<PeerAnnounce>(&msg.content) {
                         if announce.msg_type == "peer_announce" {
@@ -1543,11 +1546,6 @@ fn spawn_receive_task(
                             &msg.content,
                         ) {
                             Ok(notif) => {
-                                let now = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs();
-                                last_notification_time.store(now, Ordering::Relaxed);
                                 println!(
                                     "\x1b[36m[GOSSIP] [{} IRIs] sender={} medium={} reason={}\x1b[0m",
                                     notif.iris.len(),
