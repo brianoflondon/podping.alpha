@@ -18,16 +18,21 @@ pub struct GossipNotification {
     pub medium: String,
     pub reason: String,
     pub iris: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }
 
-// The canonical (signable) subset — same fields minus `signature`.  This is gross.
+// The canonical (signable) subset — same fields minus `signature`.
+// Fields MUST be in alphabetical order for deterministic signing.
 #[derive(Debug, Serialize)]
 struct CanonicalNotification<'a> {
     pub iris: &'a Vec<String>,
     pub medium: &'a str,
     pub reason: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     pub sender: &'a str,
     pub timestamp: u64,
     pub version: &'a str,
@@ -35,7 +40,7 @@ struct CanonicalNotification<'a> {
 
 impl GossipNotification {
     // Build a new unsigned notification
-    pub fn new(sender_pubkey_hex: &str, medium: &str, reason: &str, iris: Vec<String>) -> Self {
+    pub fn new(sender_pubkey_hex: &str, medium: &str, reason: &str, iris: Vec<String>, seq: Option<u64>) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before UNIX epoch")
@@ -48,6 +53,7 @@ impl GossipNotification {
             medium: medium.to_string(),
             reason: reason.to_string(),
             iris,
+            seq,
             signature: None,
         }
     }
@@ -60,6 +66,7 @@ impl GossipNotification {
             iris: &self.iris,
             medium: &self.medium,
             reason: &self.reason,
+            seq: self.seq,
             sender: &self.sender,
             timestamp: self.timestamp,
             version: &self.version,

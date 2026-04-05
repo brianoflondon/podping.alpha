@@ -273,6 +273,8 @@ struct GossipNotification {
     medium: String,
     reason: String,
     iris: Vec<String>,
+    #[serde(default)]
+    seq: Option<u64>,
     signature: Option<String>,
 }
 
@@ -282,6 +284,8 @@ struct CanonicalNotification<'a> {
     iris: &'a Vec<String>,
     medium: &'a str,
     reason: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
     sender: &'a str,
     timestamp: u64,
     version: &'a str,
@@ -293,6 +297,7 @@ impl GossipNotification {
             iris: &self.iris,
             medium: &self.medium,
             reason: &self.reason,
+            seq: self.seq,
             sender: &self.sender,
             timestamp: self.timestamp,
             version: &self.version,
@@ -752,6 +757,7 @@ async fn main() -> anyhow::Result<()> {
     let reconnect_count = Arc::new(AtomicU64::new(0));
     let neighbor_count = Arc::new(AtomicU32::new(0));
     let unique_sources: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let last_seq_per_sender: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
     let start_instant = std::time::Instant::now();
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let reconnect_requested = Arc::new(AtomicBool::new(false));
@@ -1000,6 +1006,7 @@ async fn main() -> anyhow::Result<()> {
         let reconnect_counter = reconnect_count.clone();
         let reconnect_neighbor_count = neighbor_count.clone();
         let reconnect_unique_sources = unique_sources.clone();
+        let reconnect_last_seq = last_seq_per_sender.clone();
         let reconnect_shared = shared_sender.clone();
         let reconnect_gossip_handle = shared_gossip.clone();
         let reconnect_endpoint = endpoint.clone();
@@ -1108,6 +1115,7 @@ async fn main() -> anyhow::Result<()> {
                                     reconnect_shutdown.clone(),
                                     reconnect_neighbor_count.clone(),
                                     reconnect_unique_sources.clone(),
+                                    reconnect_last_seq.clone(),
                                 );
 
                                 // Reset neighbor count — fresh subscription starts with 0 neighbors
@@ -1286,6 +1294,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_flag.clone(),
         neighbor_count.clone(),
         unique_sources.clone(),
+        last_seq_per_sender.clone(),
     );
 
     tokio::signal::ctrl_c().await?;
@@ -1298,7 +1307,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 //Incoming Iroh gossip event handler
-fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>, peer_names: &Arc<RwLock<HashMap<String, String>>>, sse_tx: &Option<tokio::sync::broadcast::Sender<String>>, notifications_received: &Arc<AtomicU64>) {
+fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, trusted_publishers: &Arc<RwLock<HashSet<String>>>, trusted_publishers_file: &str, last_notification_time: &Arc<AtomicU64>, db: &Option<Arc<Mutex<archive::Archive>>>, neighbor_tx: &Arc<Mutex<Option<tokio::sync::mpsc::Sender<iroh::EndpointId>>>>, peer_names: &Arc<RwLock<HashMap<String, String>>>, sse_tx: &Option<tokio::sync::broadcast::Sender<String>>, notifications_received: &Arc<AtomicU64>, last_seq_per_sender: &Arc<Mutex<HashMap<String, u64>>>) {
     match event {
         Event::Received(msg) => {
             let raw = &msg.content[..];
@@ -1429,6 +1438,23 @@ fn handle_event(event: Event, peers_file: &str, my_node_id: &iroh::EndpointId, t
                         notifications_received.fetch_add(1, Ordering::Relaxed);
                         let tp = trusted_publishers.read().unwrap();
                         if tp.is_empty() || tp.contains(&notif.sender) {
+                            // Sequence gap detection
+                            if let Some(seq) = notif.seq {
+                                let mut last_seqs = last_seq_per_sender.lock().unwrap();
+                                if let Some(&last) = last_seqs.get(&notif.sender) {
+                                    if seq > last + 1 {
+                                        let missed = seq - last - 1;
+                                        eprintln!(
+                                            "\x1b[1;33m[SEQ] Gap from {}: expected seq {}, got {} (missed {})\x1b[0m",
+                                            &notif.sender[..8.min(notif.sender.len())],
+                                            last + 1,
+                                            seq,
+                                            missed
+                                        );
+                                    }
+                                }
+                                last_seqs.insert(notif.sender.clone(), seq);
+                            }
                             let sender_display = {
                                 let names = peer_names.read().unwrap();
                                 match names.get(&notif.sender) {
@@ -1688,6 +1714,7 @@ fn spawn_receive_task(
     shutdown: Arc<AtomicBool>,
     neighbor_count: Arc<AtomicU32>,
     unique_sources: Arc<Mutex<HashSet<String>>>,
+    last_seq_per_sender: Arc<Mutex<HashMap<String, u64>>>,
 ) {
     tokio::spawn(async move {
         let heartbeat_duration = std::time::Duration::from_secs(REBOOTSTRAP_TIMEOUT * 2);
@@ -1737,6 +1764,7 @@ fn spawn_receive_task(
                     &peer_names,
                     &sse_tx,
                     &notifications_received,
+                    &last_seq_per_sender,
                 ),
                 Err(e) => {
                     eprintln!("\x1b[35m[WARN] Gossip receiver error: {}\x1b[0m", e);

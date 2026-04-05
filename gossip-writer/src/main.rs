@@ -586,6 +586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let msgs_received_counter = Arc::new(AtomicU64::new(0));
     let neighbor_count = Arc::new(AtomicU32::new(0));
     let unique_sources: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let seq_counter = Arc::new(AtomicU64::new(1));
     let start_instant = std::time::Instant::now();
 
     // Spawn the initial receive task
@@ -1147,6 +1148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let zmq_bind_clone = zmq_bind.clone();
     let signing_key_clone = signing_key.clone();
     let pubkey_hex_clone = pubkey_hex.clone();
+    let seq_counter_zmq = seq_counter.clone();
 
     let zmq_handle = tokio::task::spawn_blocking(move || {
         let ctx = zmq::Context::new();
@@ -1174,6 +1176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         db.as_ref(),
                         &tx,
                         &pull_socket,
+                        &seq_counter_zmq,
                     );
                 }
                 println!("  ZMQ thread: shutdown signal received.");
@@ -1217,6 +1220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     db.as_ref(),
                     &tx,
                     &pull_socket,
+                    &seq_counter_zmq,
                 );
                 last_flush = std::time::Instant::now();
             }
@@ -1309,6 +1313,7 @@ fn split_iris_to_fit(
             medium_str,
             reason_str,
             iris.to_vec(),
+            None, // seq not needed for size estimation
         );
         let payload = notif.sign(signing_key);
         if payload.len() <= MAX_GOSSIP_PAYLOAD {
@@ -1329,6 +1334,7 @@ fn split_iris_to_fit(
             medium_str,
             reason_str,
             current_chunk.clone(),
+            None, // seq not needed for size estimation
         );
         let test_payload = test_notif.sign(signing_key);
 
@@ -1358,6 +1364,7 @@ fn flush_batch(
     db: Option<&archive::Archive>,
     tx: &mpsc::Sender<Vec<u8>>,
     socket: &zmq::Socket,
+    seq_counter: &AtomicU64,
 ) {
     // Group IRIs by (medium_str, reason_str)
     let mut groups: HashMap<(&'static str, &'static str), Vec<String>> = HashMap::new();
@@ -1379,11 +1386,13 @@ fn flush_batch(
 
         for (chunk_idx, chunk_iris) in chunks.iter().enumerate() {
             let chunk_count = chunk_iris.len();
+            let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
             let mut notif = notification::GossipNotification::new(
                 pubkey_hex,
                 medium_str,
                 reason_str,
                 chunk_iris.clone(),
+                Some(seq),
             );
             let signed_payload = notif.sign(signing_key);
 
