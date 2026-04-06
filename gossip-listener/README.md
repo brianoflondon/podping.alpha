@@ -73,8 +73,20 @@ Expand-Archive -Path gossip-listener.zip -DestinationPath .
 
 Build locally from this repo:
 
+From the repository root:
+
 ```sh
-docker build -f docker/Dockerfile.gossip-listener -t gossip-listener:local .
+docker build -f gossip-listener/Dockerfile -t gossip-listener:local .
+docker run --rm -it \
+  -v "$(pwd)":/data \
+  gossip-listener:local
+```
+
+Or from the `gossip-listener/` directory:
+
+```sh
+cd gossip-listener
+docker build -f Dockerfile -t gossip-listener:local ..
 docker run --rm -it \
   -v "$(pwd)":/data \
   gossip-listener:local
